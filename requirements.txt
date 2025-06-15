@@ -1,8 +1,21 @@
-numpy==1.24.3
-pandas==2.0.2
-python-binance==1.0.17
-matplotlib==3.7.1
-scikit-learn==1.2.2
-torch==2.0.1
-schedule==1.2.0
-ta==0.10.2 
+# 基础依赖
+numpy==2.3.0
+pandas==2.3.0
+matplotlib==3.10.3
+scikit-learn==1.6.1
+
+# 深度学习
+torch==2.7.1
+
+# 数据处理
+ta==0.11.0  # 技术分析库
+imbalanced-learn==0.13.0  # 处理不平衡数据
+
+# API交互
+requests==2.31.0
+websocket-client==1.7.0
+python-binance==1.0.19
+
+# 工具
+tqdm==4.66.1  # 进度条
+python-dateutil==2.9.0.post0 

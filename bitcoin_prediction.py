@@ -62,7 +62,7 @@ DEFAULT_CONFIG = {
     'fear_greed_weight': 0.1,  # 🔧 新增：恐慌贪婪指数权重
     'bet_amount': 5,  # 固定投注金额为5u
     'payout_ratio': 0.8,  # 事件合约盈利率80%
-    'big_trade_threshold': 0.1,  # 大单交易阈值，单位BTC (约1万美元)
+    'big_trade_threshold': 0.01,  # 大单交易阈值，单位BTC (约1000美元)
 }
 
 # 加载或创建配置
@@ -412,13 +412,13 @@ class EnhancedBinanceAPI:
             
             # 确保config中有big_trade_threshold，如果没有则设置默认值
             if 'big_trade_threshold' not in self.config:
-                self.config['big_trade_threshold'] = 0.1  # 默认0.1 BTC为大单阈值
+                self.config['big_trade_threshold'] = 0.01  # 默认0.01 BTC为大单阈值
                 logging.info(f"⚠️ 未找到大单阈值配置，设置默认值为 {self.config['big_trade_threshold']} BTC")
             
-            # 确保阈值在合理范围内（0.01-10 BTC）
+            # 确保阈值在合理范围内（0.001-10 BTC）
             if self.config['big_trade_threshold'] > 10:
-                logging.warning(f"⚠️ 大单阈值过高 ({self.config['big_trade_threshold']} BTC)，调整为 1 BTC")
-                self.config['big_trade_threshold'] = 1.0
+                logging.warning(f"⚠️ 大单阈值过高 ({self.config['big_trade_threshold']} BTC)，调整为 0.05 BTC")
+                self.config['big_trade_threshold'] = 0.05
             
             for trade in trades:
                 qty = float(trade['qty'])
@@ -658,7 +658,13 @@ class EnhancedDataProcessor:
             df['big_buy_ratio'] = (sum(t['qty'] for t in recent_big_trades if not t['is_buyer_maker']) / 
                                  max(1, sum(t['qty'] for t in recent_big_trades)))
             
-            logging.info(f"💰 检测到{len(recent_big_trades)}笔大单")
+            # 使用与get_recent_trades相同的格式显示大单信息
+            threshold = self.config.get('big_trade_threshold', 0.01)
+            if recent_big_trades:
+                logging.info(f"💰 检测到 {len(recent_big_trades)} 笔最近1分钟内的大单交易 (>{threshold} BTC)")
+            else:
+                logging.info(f"💰 最近1分钟内无大单交易 (>{threshold} BTC)")
+                
             return df
         except Exception as e:
             logging.error(f"❌ 添加大单特征失败: {e}")
@@ -1551,6 +1557,10 @@ class BitcoinPredictor:
                 X = X_balanced.reshape(-1, X.shape[1], X.shape[2])
                 y = y_balanced.reshape(-1, 1)
                 logging.info(f"✅ SMOTE平衡后数据量: {X.shape[0]}")
+                
+                # 再次检查平衡后的类别分布
+                unique_balanced, counts_balanced = np.unique(y_balanced, return_counts=True)
+                logging.info(f"平衡后类别分布: {dict(zip(unique_balanced, counts_balanced))}")
             else:
                 logging.info("📊 数据已经相对平衡，无需SMOTE处理")
                 
@@ -1559,7 +1569,7 @@ class BitcoinPredictor:
         
         # 划分训练集和测试集
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, train_size=self.config['train_size'], shuffle=False
+            X, y, train_size=self.config.get('train_size', 0.8), shuffle=False
         )
         
         # 创建数据加载器
@@ -1577,6 +1587,10 @@ class BitcoinPredictor:
         input_size = X.shape[2]
         base_hidden_size = self.config['hidden_size']  # 使用配置中的hidden_size作为基础
         logging.info(f"📝 训练新模型，使用配置中的hidden_size={base_hidden_size}")
+        
+        # 🆕 添加训练曲线可视化数据收集
+        all_train_losses = []
+        all_val_accuracies = []
         
         for model_idx in range(3):  # 训练3个不同的模型
             logging.info(f"🔄 训练第 {model_idx + 1}/3 个集成模型...")
@@ -1597,8 +1611,16 @@ class BitcoinPredictor:
             criterion = nn.BCELoss()
             optimizer = optim.Adam(model.parameters(), lr=self.config['learning_rate'] * (1 + model_idx * 0.1))
             
+            # 🆕 添加学习率调度器
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=5
+            )
+            
             # 📅 训练循环
             best_model_accuracy = 0
+            model_train_losses = []
+            model_val_accuracies = []
+            
             for epoch in range(self.config['epochs']):
                 model.train()
                 train_loss = 0
@@ -1620,24 +1642,58 @@ class BitcoinPredictor:
                 model.eval()
                 correct = 0
                 total = 0
+                val_loss = 0
                 with torch.no_grad():
                     for batch_X, batch_y in test_loader:
                         batch_X, batch_y = batch_X.to(self.device), batch_y.to(self.device)
                         outputs = model(batch_X)
+                        val_loss += criterion(outputs, batch_y).item()
                         predicted = (outputs > 0.5).float()
                         total += batch_y.size(0)
                         correct += (predicted == batch_y).sum().item()
                 
-                accuracy = correct / total
+                accuracy = correct / total if total > 0 else 0
+                
+                # 记录训练指标
+                avg_train_loss = train_loss/len(train_loader)
+                avg_val_loss = val_loss/len(test_loader)
+                model_train_losses.append(avg_train_loss)
+                model_val_accuracies.append(accuracy)
+                
+                # 更新学习率调度器
+                old_lr = optimizer.param_groups[0]['lr']
+                scheduler.step(avg_val_loss)
+                new_lr = optimizer.param_groups[0]['lr']
+                
+                # 手动记录学习率变化
+                if new_lr != old_lr:
+                    logging.info(f"学习率从 {old_lr:.6f} 调整为 {new_lr:.6f}")
+                
                 if accuracy > best_model_accuracy:
                     best_model_accuracy = accuracy
+                    # 保存最佳模型状态
+                    best_model_state = {
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'accuracy': accuracy,
+                    }
                 
                 if (epoch + 1) % 10 == 0 or epoch == 0:
                     logging.info(f"模型{model_idx+1} Epoch [{epoch+1}/{self.config['epochs']}], "
-                               f"Loss: {train_loss/len(train_loader):.4f}, "
+                               f"Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, "
                                f"Accuracy: {accuracy:.4f}")
             
+            # 收集该模型的训练曲线数据
+            all_train_losses.append(model_train_losses)
+            all_val_accuracies.append(model_val_accuracies)
+            
             # 🎯 每个模型训练完成后添加到集成
+            # 加载最佳模型状态
+            if 'best_model_state' in locals():
+                model.load_state_dict(best_model_state['model_state_dict'])
+                logging.info(f"加载最佳模型状态 (Epoch {best_model_state['epoch']+1}, Accuracy: {best_model_state['accuracy']:.4f})")
+            
             self.ensemble_models.append({
                 'model': model,
                 'accuracy': best_model_accuracy,
@@ -1658,9 +1714,52 @@ class BitcoinPredictor:
         logging.info(f"📊 集成模型权重: {[f'{m['weight']:.3f}' for m in self.ensemble_models]}")
         logging.info(f"🎯 最佳单模型准确率: {best_accuracy:.4f}")
         
+        # 🆕 生成训练曲线可视化
+        try:
+            self.plot_training_curves(all_train_losses, all_val_accuracies)
+        except Exception as e:
+            logging.error(f"生成训练曲线可视化失败: {e}")
+        
         # 保存最佳模型
         self.save_model(input_size)
         return True
+    
+    def plot_training_curves(self, all_train_losses, all_val_accuracies):
+        """生成训练曲线可视化图表"""
+        try:
+            plt.style.use('dark_background')
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+            
+            # 绘制训练损失曲线
+            ax1.set_title('训练损失曲线', fontsize=14, fontweight='bold')
+            ax1.set_xlabel('Epoch')
+            ax1.set_ylabel('Loss')
+            
+            colors = ['#00BFFF', '#00FF7F', '#FFD700']  # 蓝色, 绿色, 黄色
+            
+            for i, losses in enumerate(all_train_losses):
+                ax1.plot(losses, label=f'模型 {i+1}', color=colors[i], linewidth=2)
+            
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            
+            # 绘制验证准确率曲线
+            ax2.set_title('验证准确率曲线', fontsize=14, fontweight='bold')
+            ax2.set_xlabel('Epoch')
+            ax2.set_ylabel('Accuracy')
+            ax2.set_ylim(0, 1)
+            
+            for i, accuracies in enumerate(all_val_accuracies):
+                ax2.plot(accuracies, label=f'模型 {i+1}', color=colors[i], linewidth=2)
+            
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig('training_curves.png', dpi=300)
+            logging.info("✅ 训练曲线可视化已保存至 training_curves.png")
+        except Exception as e:
+            logging.error(f"绘制训练曲线失败: {e}")
     
     def predict(self):
         """使用增强预测系统进行预测 - 保持完整准确率"""
@@ -1824,6 +1923,102 @@ class BitcoinPredictor:
             if not trade_recommended:
                 trade_signal = "⏸️ 观望"
             
+            # 🆕 新增：严格的技术指标过滤条件
+            # 获取当前技术指标
+            try:
+                # 获取最新的技术指标
+                current_price = self.api.get_latest_price(self.config['symbol'])
+                if current_price is None:
+                    logging.warning("⚠️ 无法获取当前价格，跳过技术指标过滤")
+                else:
+                    # 获取技术指标数据
+                    klines_1m = self.api.client.get_klines(symbol=self.config['symbol'], interval='1m', limit=100)
+                    if klines_1m:
+                        df_tech = pd.DataFrame(klines_1m, columns=[
+                            'open_time', 'open', 'high', 'low', 'close', 'volume',
+                            'close_time', 'quote_asset_volume', 'number_of_trades',
+                            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+                        ])
+                        
+                        # 数据类型转换
+                        numeric_columns = ['open', 'high', 'low', 'close', 'volume']
+                        for col in numeric_columns:
+                            df_tech[col] = pd.to_numeric(df_tech[col])
+                        
+                        # 计算技术指标
+                        # RSI
+                        rsi_14 = ta.momentum.rsi(df_tech['close'], window=14).iloc[-1]
+                        
+                        # MACD
+                        macd = ta.trend.MACD(df_tech['close'])
+                        macd_line = macd.macd().iloc[-1]
+                        macd_signal = macd.macd_signal().iloc[-1]
+                        macd_hist = macd.macd_diff().iloc[-1]
+                        
+                        # 布林带
+                        bollinger = ta.volatility.BollingerBands(df_tech['close'])
+                        bb_upper = bollinger.bollinger_hband().iloc[-1]
+                        bb_middle = bollinger.bollinger_mavg().iloc[-1]
+                        bb_lower = bollinger.bollinger_lband().iloc[-1]
+                        
+                        # 移动平均线
+                        sma_20 = ta.trend.sma_indicator(df_tech['close'], window=20).iloc[-1]
+                        sma_50 = ta.trend.sma_indicator(df_tech['close'], window=50).iloc[-1]
+                        
+                        # 成交量
+                        volume_sma = df_tech['volume'].rolling(20).mean().iloc[-1]
+                        current_volume = df_tech['volume'].iloc[-1]
+                        
+                        # 🆕 严格的技术指标过滤规则
+                        tech_filters_passed = True
+                        filter_messages = []
+                        
+                        # 规则1: 超买/超卖过滤
+                        if direction == "上涨" and rsi_14 > 70:
+                            tech_filters_passed = False
+                            filter_messages.append(f"RSI过高({rsi_14:.1f} > 70)，不适合做多")
+                        elif direction == "下跌" and rsi_14 < 30:
+                            tech_filters_passed = False
+                            filter_messages.append(f"RSI过低({rsi_14:.1f} < 30)，不适合做空")
+                        
+                        # 规则2: MACD方向与预测方向一致性检查
+                        if direction == "上涨" and macd_hist < 0:
+                            tech_filters_passed = False
+                            filter_messages.append(f"MACD柱状图为负({macd_hist:.4f})，与做多信号不一致")
+                        elif direction == "下跌" and macd_hist > 0:
+                            tech_filters_passed = False
+                            filter_messages.append(f"MACD柱状图为正({macd_hist:.4f})，与做空信号不一致")
+                        
+                        # 规则3: 布林带位置检查
+                        current_price = df_tech['close'].iloc[-1]
+                        if direction == "上涨" and current_price > bb_upper:
+                            tech_filters_passed = False
+                            filter_messages.append(f"价格已超过布林带上轨，不适合做多")
+                        elif direction == "下跌" and current_price < bb_lower:
+                            tech_filters_passed = False
+                            filter_messages.append(f"价格已低于布林带下轨，不适合做空")
+                        
+                        # 规则4: 趋势方向检查
+                        if direction == "上涨" and current_price < sma_20:
+                            tech_filters_passed = False
+                            filter_messages.append(f"价格低于20日均线，与做多信号不一致")
+                        elif direction == "下跌" and current_price > sma_20:
+                            tech_filters_passed = False
+                            filter_messages.append(f"价格高于20日均线，与做空信号不一致")
+                        
+                        # 规则5: 成交量确认
+                        if current_volume < volume_sma * 0.7:
+                            tech_filters_passed = False
+                            filter_messages.append(f"成交量过低，信号可靠性降低")
+                        
+                        # 如果没有通过技术指标过滤，则不推荐交易
+                        if not tech_filters_passed:
+                            trade_recommended = False
+                            trade_signal = "⏸️ 观望 (技术指标过滤)"
+                            logging.info(f"⚠️ 技术指标过滤: {'; '.join(filter_messages)}")
+            except Exception as e:
+                logging.warning(f"⚠️ 技术指标过滤出错: {e}")
+            
             result = {
                 'timestamp': datetime.now(),
                 'current_price': self.api.get_latest_price('BTCUSDT'),
@@ -1837,7 +2032,9 @@ class BitcoinPredictor:
                 'technical_strength': tech_strength,
                 'sentiment_strength': sentiment_strength,
                 'prediction_variance': prediction_variance,
-                'confidence_adjustments': confidence_adjustments
+                'confidence_adjustments': confidence_adjustments,
+                'tech_filters_passed': locals().get('tech_filters_passed', True),
+                'filter_messages': locals().get('filter_messages', [])
             }
             
             return result
