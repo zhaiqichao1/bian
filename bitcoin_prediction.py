@@ -38,32 +38,38 @@ logging.basicConfig(
 # 配置文件
 CONFIG_FILE = 'config.json'
 
-# 默认配置 - 🔧 技术改进：增加历史数据获取范围
-DEFAULT_CONFIG = {
-    'api_key': '',
-    'api_secret': '',
-    'symbol': 'BTCUSDT',
-    'intervals': ['1m', '5m', '15m'],
-    'lookback_hours': 72,  # 🔧 从24小时增加到72小时，确保足够的历史数据
-    'prediction_minutes': 10,
-    'hidden_size': 128,
-    'num_layers': 2,
-    'dropout': 0.2,
-    'learning_rate': 0.001,
-    'batch_size': 32,
-    'epochs': 50,
-    'sequence_length': 10,
-    'trade_amount': 100,
-    'stop_loss': 0.02,
-    'take_profit': 0.03,
-    'min_confidence_threshold': 60,  # 🔧 新增：最低置信度门槛
-    'enhanced_sentiment_enabled': True,  # 🔧 新增：启用增强情绪分析
-    'soft_confidence_floor': 15,  # 🔧 新增：置信度软下限
-    'fear_greed_weight': 0.1,  # 🔧 新增：恐慌贪婪指数权重
-    'bet_amount': 5,  # 固定投注金额为5u
-    'payout_ratio': 0.8,  # 事件合约盈利率80%
-    'big_trade_threshold': 0.01,  # 大单交易阈值，单位BTC (约1000美元)
-}
+# 导入配置模块
+try:
+    from config import DEFAULT_CONFIG
+except ImportError:
+    # 默认配置 - 如果config.py不存在
+    DEFAULT_CONFIG = {
+        'api_key': '',
+        'api_secret': '',
+        'symbol': 'BTCUSDT',
+        'intervals': ['1m', '5m', '15m'],
+        'lookback_hours': 72,  # 从24小时增加到72小时，确保足够的历史数据
+        'prediction_minutes': 10,
+        'hidden_size': 128,
+        'num_layers': 2,
+        'dropout': 0.2,
+        'learning_rate': 0.001,
+        'batch_size': 32,
+        'epochs': 50,
+        'sequence_length': 10,
+        'trade_amount': 100,
+        'stop_loss': 0.02,
+        'take_profit': 0.03,
+        'min_confidence_threshold': 75,  # 提高最低置信度门槛到75%
+        'enhanced_sentiment_enabled': True,
+        'soft_confidence_floor': 15,
+        'fear_greed_weight': 0.1,
+        'bet_amount': 5,  # 固定投注金额为5u
+        'payout_ratio': 0.8,  # 事件合约盈利率80%
+        'big_trade_threshold': 0.01,  # 大单交易阈值，单位BTC
+        'tech_score_threshold': 2,  # 技术指标评分阈值
+    }
+    logging.warning("未找到config.py文件，使用内置默认配置")
 
 # 加载或创建配置
 def load_config():
@@ -1312,17 +1318,465 @@ class EnhancedDataProcessor:
             return X_tensor
 
 # 模型训练和预测类
+def technical_filter_score(df_tech, direction):
+    """
+    增强版技术指标过滤，使用评分机制而不是简单的全部通过/不通过
+    
+    参数:
+    - df_tech: 包含技术指标的DataFrame
+    - direction: 预测方向 "上涨" 或 "下跌"
+    
+    返回:
+    - score: 技术指标评分 (-10 到 +10)
+    - details: 评分详情列表
+    """
+    score = 0
+    details = []
+    
+    # 获取最新价格和技术指标
+    current_price = df_tech['close'].iloc[-1]
+    
+    # 1. RSI评分 (-2 到 +2)
+    rsi_14 = ta.momentum.rsi(df_tech['close'], window=14).iloc[-1]
+    if direction == "上涨":
+        if rsi_14 > 70:
+            score -= 2
+            details.append(f"RSI过高({rsi_14:.1f} > 70): -2分")
+        elif rsi_14 > 60:
+            score += 1
+            details.append(f"RSI强势({rsi_14:.1f}): +1分")
+        elif rsi_14 < 30:
+            score += 2
+            details.append(f"RSI超卖({rsi_14:.1f}): +2分")
+    else:  # 下跌
+        if rsi_14 < 30:
+            score -= 2
+            details.append(f"RSI过低({rsi_14:.1f} < 30): -2分")
+        elif rsi_14 < 40:
+            score += 1
+            details.append(f"RSI弱势({rsi_14:.1f}): +1分")
+        elif rsi_14 > 70:
+            score += 2
+            details.append(f"RSI超买({rsi_14:.1f}): +2分")
+    
+    # 2. MACD评分 (-3 到 +3) - 增强版，考虑交叉点
+    macd = ta.trend.MACD(df_tech['close'])
+    macd_line = macd.macd().iloc[-1]  # DIF
+    macd_signal = macd.macd_signal().iloc[-1]  # DEA
+    macd_hist = macd.macd_diff().iloc[-1]  # MACD柱状图
+    
+    # MACD柱状图方向
+    if direction == "上涨":
+        if macd_hist > 0:
+            score += 2
+            details.append(f"MACD柱状图为正({macd_hist:.4f}): +2分")
+        else:
+            score -= 2
+            details.append(f"MACD柱状图为负({macd_hist:.4f}): -2分")
+        
+        # MACD交叉点判断 - DIF上穿DEA为金叉
+        if macd_line > macd_signal:
+            score += 1
+            details.append(f"MACD金叉(DIF > DEA): +1分")
+    else:  # 下跌
+        if macd_hist < 0:
+            score += 2
+            details.append(f"MACD柱状图为负({macd_hist:.4f}): +2分")
+        else:
+            score -= 2
+            details.append(f"MACD柱状图为正({macd_hist:.4f}): -2分")
+        
+        # MACD交叉点判断 - DIF下穿DEA为死叉
+        if macd_line < macd_signal:
+            score += 1
+            details.append(f"MACD死叉(DIF < DEA): +1分")
+    
+    # 3. 布林带评分 (-2 到 +2) - 增强版，考虑突破
+    bollinger = ta.volatility.BollingerBands(df_tech['close'])
+    bb_upper = bollinger.bollinger_hband().iloc[-1]
+    bb_middle = bollinger.bollinger_mavg().iloc[-1]
+    bb_lower = bollinger.bollinger_lband().iloc[-1]
+    
+    # 计算布林带宽度
+    bb_width = (bb_upper - bb_lower) / bb_middle
+    
+    # 布林带位置评分
+    if direction == "上涨":
+        if current_price > bb_upper:
+            # 如果布林带扩张，突破上轨可能是强势信号
+            if bb_width > bb_width_avg(df_tech, 20):
+                score += 1
+                details.append(f"价格突破布林带上轨且带宽扩张: +1分")
+            else:
+                score -= 1
+                details.append(f"价格已超过布林带上轨: -1分")
+        elif current_price < bb_lower:
+            score += 2
+            details.append(f"价格低于布林带下轨(超卖): +2分")
+    else:  # 下跌
+        if current_price < bb_lower:
+            # 如果布林带扩张，突破下轨可能是强势信号
+            if bb_width > bb_width_avg(df_tech, 20):
+                score += 1
+                details.append(f"价格突破布林带下轨且带宽扩张: +1分")
+            else:
+                score -= 1
+                details.append(f"价格已低于布林带下轨: -1分")
+        elif current_price > bb_upper:
+            score += 2
+            details.append(f"价格高于布林带上轨(超买): +2分")
+    
+    # 4. 移动平均线评分 (-2 到 +2)
+    sma_20 = ta.trend.sma_indicator(df_tech['close'], window=20).iloc[-1]
+    sma_50 = ta.trend.sma_indicator(df_tech['close'], window=50).iloc[-1]
+    
+    # 价格与均线关系
+    if direction == "上涨":
+        if current_price > sma_20:
+            score += 1
+            details.append(f"价格高于20日均线: +1分")
+        else:
+            score -= 1
+            details.append(f"价格低于20日均线: -1分")
+        
+        # 均线多头排列
+        if sma_20 > sma_50:
+            score += 1
+            details.append(f"20日均线高于50日均线(多头排列): +1分")
+    else:  # 下跌
+        if current_price < sma_20:
+            score += 1
+            details.append(f"价格低于20日均线: +1分")
+        else:
+            score -= 1
+            details.append(f"价格高于20日均线: -1分")
+        
+        # 均线空头排列
+        if sma_20 < sma_50:
+            score += 1
+            details.append(f"20日均线低于50日均线(空头排列): +1分")
+    
+    # 5. 成交量评分 (-1 到 +1)
+    volume_sma = df_tech['volume'].rolling(20).mean().iloc[-1]
+    current_volume = df_tech['volume'].iloc[-1]
+    
+    if current_volume > volume_sma * 1.2:
+        score += 1
+        details.append(f"成交量放大(当前/均值={current_volume/volume_sma:.2f}): +1分")
+    elif current_volume < volume_sma * 0.7:
+        score -= 1
+        details.append(f"成交量萎缩(当前/均值={current_volume/volume_sma:.2f}): -1分")
+    
+    return score, details
+
+def bb_width_avg(df, window=20):
+    """计算过去N个周期的布林带平均宽度"""
+    bollinger = ta.volatility.BollingerBands(df['close'])
+    upper = bollinger.bollinger_hband()
+    middle = bollinger.bollinger_mavg()
+    lower = bollinger.bollinger_lband()
+    
+    # 计算布林带宽度
+    width = (upper - lower) / middle
+    
+    # 返回平均宽度
+    return width.rolling(window).mean().iloc[-1]
+
+def multi_timeframe_check(df_tech, direction):
+    """
+    多时间周期一致性检查，确保不同时间周期的信号一致
+    
+    参数:
+    - df_tech: 包含技术指标的DataFrame (1分钟K线)
+    - direction: 预测方向 "上涨" 或 "下跌"
+    
+    返回:
+    - score: 多时间周期一致性得分 (-3 到 +3)
+    - details: 详情列表
+    """
+    score = 0
+    details = []
+    
+    try:
+        # 从1分钟K线生成5分钟和15分钟K线
+        df_5m = df_tech.copy()
+        df_5m.set_index('open_time', inplace=True)
+        df_5m = df_5m.resample('5T').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
+        
+        df_15m = df_tech.copy()
+        df_15m.set_index('open_time', inplace=True)
+        df_15m = df_15m.resample('15T').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
+        
+        # 计算不同时间周期的技术指标
+        # 1. RSI
+        rsi_1m = ta.momentum.rsi(df_tech['close'], window=14).iloc[-1]
+        rsi_5m = ta.momentum.rsi(df_5m['close'], window=14).iloc[-1] if len(df_5m) > 14 else 50
+        rsi_15m = ta.momentum.rsi(df_15m['close'], window=14).iloc[-1] if len(df_15m) > 14 else 50
+        
+        # 2. MACD
+        macd_1m = ta.trend.MACD(df_tech['close'])
+        macd_hist_1m = macd_1m.macd_diff().iloc[-1]
+        
+        macd_5m = ta.trend.MACD(df_5m['close']) if len(df_5m) > 26 else None
+        macd_hist_5m = macd_5m.macd_diff().iloc[-1] if macd_5m is not None else 0
+        
+        macd_15m = ta.trend.MACD(df_15m['close']) if len(df_15m) > 26 else None
+        macd_hist_15m = macd_15m.macd_diff().iloc[-1] if macd_15m is not None else 0
+        
+        # 3. 移动平均线
+        ma20_1m = ta.trend.sma_indicator(df_tech['close'], window=20).iloc[-1]
+        ma20_5m = ta.trend.sma_indicator(df_5m['close'], window=20).iloc[-1] if len(df_5m) > 20 else df_5m['close'].iloc[-1]
+        ma20_15m = ta.trend.sma_indicator(df_15m['close'], window=20).iloc[-1] if len(df_15m) > 20 else df_15m['close'].iloc[-1]
+        
+        current_price = df_tech['close'].iloc[-1]
+        
+        # 检查RSI一致性
+        rsi_bullish = 0
+        rsi_bearish = 0
+        
+        # RSI多时间周期一致性
+        if direction == "上涨":
+            if rsi_1m > 50: rsi_bullish += 1
+            if rsi_5m > 50: rsi_bullish += 1
+            if rsi_15m > 50: rsi_bullish += 1
+            
+            if rsi_bullish >= 2:
+                score += 1
+                details.append(f"RSI多时间周期看涨一致性: +1分 (1m={rsi_1m:.1f}, 5m={rsi_5m:.1f}, 15m={rsi_15m:.1f})")
+            elif rsi_bullish == 0:
+                score -= 1
+                details.append(f"RSI多时间周期看跌一致性: -1分 (1m={rsi_1m:.1f}, 5m={rsi_5m:.1f}, 15m={rsi_15m:.1f})")
+        else:  # 下跌
+            if rsi_1m < 50: rsi_bearish += 1
+            if rsi_5m < 50: rsi_bearish += 1
+            if rsi_15m < 50: rsi_bearish += 1
+            
+            if rsi_bearish >= 2:
+                score += 1
+                details.append(f"RSI多时间周期看跌一致性: +1分 (1m={rsi_1m:.1f}, 5m={rsi_5m:.1f}, 15m={rsi_15m:.1f})")
+            elif rsi_bearish == 0:
+                score -= 1
+                details.append(f"RSI多时间周期看涨一致性: -1分 (1m={rsi_1m:.1f}, 5m={rsi_5m:.1f}, 15m={rsi_15m:.1f})")
+        
+        # 检查MACD一致性
+        macd_bullish = 0
+        macd_bearish = 0
+        
+        if direction == "上涨":
+            if macd_hist_1m > 0: macd_bullish += 1
+            if macd_hist_5m > 0: macd_bullish += 1
+            if macd_hist_15m > 0: macd_bullish += 1
+            
+            if macd_bullish >= 2:
+                score += 1
+                details.append(f"MACD多时间周期看涨一致性: +1分")
+            elif macd_bullish == 0:
+                score -= 1
+                details.append(f"MACD多时间周期看跌一致性: -1分")
+        else:  # 下跌
+            if macd_hist_1m < 0: macd_bearish += 1
+            if macd_hist_5m < 0: macd_bearish += 1
+            if macd_hist_15m < 0: macd_bearish += 1
+            
+            if macd_bearish >= 2:
+                score += 1
+                details.append(f"MACD多时间周期看跌一致性: +1分")
+            elif macd_bearish == 0:
+                score -= 1
+                details.append(f"MACD多时间周期看涨一致性: -1分")
+        
+        # 检查均线一致性
+        ma_bullish = 0
+        ma_bearish = 0
+        
+        if direction == "上涨":
+            if current_price > ma20_1m: ma_bullish += 1
+            if current_price > ma20_5m: ma_bullish += 1
+            if current_price > ma20_15m: ma_bullish += 1
+            
+            if ma_bullish >= 2:
+                score += 1
+                details.append(f"均线多时间周期看涨一致性: +1分")
+            elif ma_bullish == 0:
+                score -= 1
+                details.append(f"均线多时间周期看跌一致性: -1分")
+        else:  # 下跌
+            if current_price < ma20_1m: ma_bearish += 1
+            if current_price < ma20_5m: ma_bearish += 1
+            if current_price < ma20_15m: ma_bearish += 1
+            
+            if ma_bearish >= 2:
+                score += 1
+                details.append(f"均线多时间周期看跌一致性: +1分")
+            elif ma_bearish == 0:
+                score -= 1
+                details.append(f"均线多时间周期看涨一致性: -1分")
+        
+    except Exception as e:
+        logging.warning(f"多时间周期检查出错: {e}")
+    
+    return score, details
+
+def trend_confirmation_check(df_tech, direction):
+    """
+    趋势确认检查，确保预测方向与当前趋势一致
+    
+    参数:
+    - df_tech: 包含技术指标的DataFrame
+    - direction: 预测方向 "上涨" 或 "下跌"
+    
+    返回:
+    - score: 趋势确认得分 (-2 到 +2)
+    - details: 详情列表
+    """
+    score = 0
+    details = []
+    
+    try:
+        # 获取当前价格和最近价格
+        current_price = df_tech['close'].iloc[-1]
+        
+        # 计算趋势指标
+        # 1. 短期趋势 (10周期)
+        short_term_trend = df_tech['close'].iloc[-10:].pct_change().mean() * 100
+        
+        # 2. 中期趋势 (30周期)
+        mid_term_trend = df_tech['close'].iloc[-30:].pct_change().mean() * 100
+        
+        # 3. 价格位置相对于均线
+        ma_10 = ta.trend.sma_indicator(df_tech['close'], window=10).iloc[-1]
+        ma_20 = ta.trend.sma_indicator(df_tech['close'], window=20).iloc[-1]
+        ma_50 = ta.trend.sma_indicator(df_tech['close'], window=50).iloc[-1]
+        
+        price_above_ma10 = current_price > ma_10
+        price_above_ma20 = current_price > ma_20
+        price_above_ma50 = current_price > ma_50
+        
+        # 4. 均线排列
+        ma_alignment_bullish = ma_10 > ma_20 > ma_50
+        ma_alignment_bearish = ma_10 < ma_20 < ma_50
+        
+        # 5. ADX (趋势强度)
+        adx = ta.trend.adx(df_tech['high'], df_tech['low'], df_tech['close'], window=14).iloc[-1]
+        strong_trend = adx > 25
+        
+        # 评分逻辑
+        if direction == "上涨":
+            # 短期趋势
+            if short_term_trend > 0.1:
+                score += 0.5
+                details.append(f"短期趋势向上 ({short_term_trend:.2f}%): +0.5分")
+            elif short_term_trend < -0.1:
+                score -= 0.5
+                details.append(f"短期趋势向下 ({short_term_trend:.2f}%): -0.5分")
+            
+            # 中期趋势
+            if mid_term_trend > 0.05:
+                score += 0.5
+                details.append(f"中期趋势向上 ({mid_term_trend:.2f}%): +0.5分")
+            elif mid_term_trend < -0.05:
+                score -= 0.5
+                details.append(f"中期趋势向下 ({mid_term_trend:.2f}%): -0.5分")
+            
+            # 价格位置
+            ma_score = 0
+            if price_above_ma10: ma_score += 1
+            if price_above_ma20: ma_score += 1
+            if price_above_ma50: ma_score += 1
+            
+            if ma_score >= 2:
+                score += 0.5
+                details.append(f"价格位于多数均线上方: +0.5分")
+            elif ma_score <= 1:
+                score -= 0.5
+                details.append(f"价格位于多数均线下方: -0.5分")
+            
+            # 均线排列
+            if ma_alignment_bullish:
+                score += 0.5
+                details.append("均线多头排列: +0.5分")
+            elif ma_alignment_bearish:
+                score -= 0.5
+                details.append("均线空头排列: -0.5分")
+            
+        else:  # 下跌
+            # 短期趋势
+            if short_term_trend < -0.1:
+                score += 0.5
+                details.append(f"短期趋势向下 ({short_term_trend:.2f}%): +0.5分")
+            elif short_term_trend > 0.1:
+                score -= 0.5
+                details.append(f"短期趋势向上 ({short_term_trend:.2f}%): -0.5分")
+            
+            # 中期趋势
+            if mid_term_trend < -0.05:
+                score += 0.5
+                details.append(f"中期趋势向下 ({mid_term_trend:.2f}%): +0.5分")
+            elif mid_term_trend > 0.05:
+                score -= 0.5
+                details.append(f"中期趋势向上 ({mid_term_trend:.2f}%): -0.5分")
+            
+            # 价格位置
+            ma_score = 0
+            if not price_above_ma10: ma_score += 1
+            if not price_above_ma20: ma_score += 1
+            if not price_above_ma50: ma_score += 1
+            
+            if ma_score >= 2:
+                score += 0.5
+                details.append(f"价格位于多数均线下方: +0.5分")
+            elif ma_score <= 1:
+                score -= 0.5
+                details.append(f"价格位于多数均线上方: -0.5分")
+            
+            # 均线排列
+            if ma_alignment_bearish:
+                score += 0.5
+                details.append("均线空头排列: +0.5分")
+            elif ma_alignment_bullish:
+                score -= 0.5
+                details.append("均线多头排列: -0.5分")
+        
+        # 趋势强度加成
+        if strong_trend:
+            if (direction == "上涨" and score > 0) or (direction == "下跌" and score > 0):
+                bonus = 0.5
+                score += bonus
+                details.append(f"强趋势确认(ADX={adx:.1f}): +{bonus}分")
+        
+    except Exception as e:
+        logging.warning(f"趋势确认检查出错: {e}")
+    
+    return score, details
+
 class BitcoinPredictor:
     def __init__(self, config):
         self.config = config
         self.model = None
+        self.ensemble_models = []  # 初始化集成模型列表
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.api = EnhancedBinanceAPI(config['api_key'], config['api_secret'], config)
         self.data_processor = EnhancedDataProcessor(config)
         self.simulation_records = []
         # 添加马丁格尔策略变量
         self.current_bet_level = 0  # 当前投注级别：0=5U, 1=10U, 2=30U, 3=90U, 4=250U
-        self.martingale_bet_amounts = [5, 10, 30, 90, 250]  # 马丁格尔投注金额序列
+        # 从配置中获取马丁格尔策略参数
+        if 'bet_amounts' in config.get('MARTINGALE_CONFIG', {}):
+            self.martingale_bet_amounts = config['MARTINGALE_CONFIG']['bet_amounts']
+        else:
+            self.martingale_bet_amounts = [5, 10, 30, 90, 250]  # 默认马丁格尔投注金额序列
         self.load_model()
     
     def load_model(self):
@@ -1728,29 +2182,34 @@ class BitcoinPredictor:
         """生成训练曲线可视化图表"""
         try:
             plt.style.use('dark_background')
+            
+            # 设置中文字体支持
+            plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']  # 优先使用中文字体
+            plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+            
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
             
             # 绘制训练损失曲线
-            ax1.set_title('训练损失曲线', fontsize=14, fontweight='bold')
+            ax1.set_title('Training Loss Curve', fontsize=14, fontweight='bold')  # 使用英文标题
             ax1.set_xlabel('Epoch')
             ax1.set_ylabel('Loss')
             
             colors = ['#00BFFF', '#00FF7F', '#FFD700']  # 蓝色, 绿色, 黄色
             
             for i, losses in enumerate(all_train_losses):
-                ax1.plot(losses, label=f'模型 {i+1}', color=colors[i], linewidth=2)
+                ax1.plot(losses, label=f'Model {i+1}', color=colors[i], linewidth=2)
             
             ax1.legend()
             ax1.grid(True, alpha=0.3)
             
             # 绘制验证准确率曲线
-            ax2.set_title('验证准确率曲线', fontsize=14, fontweight='bold')
+            ax2.set_title('Validation Accuracy Curve', fontsize=14, fontweight='bold')  # 使用英文标题
             ax2.set_xlabel('Epoch')
             ax2.set_ylabel('Accuracy')
             ax2.set_ylim(0, 1)
             
             for i, accuracies in enumerate(all_val_accuracies):
-                ax2.plot(accuracies, label=f'模型 {i+1}', color=colors[i], linewidth=2)
+                ax2.plot(accuracies, label=f'Model {i+1}', color=colors[i], linewidth=2)
             
             ax2.legend()
             ax2.grid(True, alpha=0.3)
@@ -1917,11 +2376,17 @@ class BitcoinPredictor:
             
             # 9. 预测结果
             direction = "上涨" if weighted_prediction > 0.5 else "下跌"
-            trade_signal = "📈 买涨" if weighted_prediction > 0.5 else "📉 买跌"
             
             # 🔧 根据置信度调整交易信号
-            if not trade_recommended:
+            # 高置信度预测(>90%)即使技术指标不足也允许交易
+            if final_confidence >= 0.9:
+                # 高置信度预测强制推荐交易
+                trade_recommended = True
+                trade_signal = "📈 买涨(高置信度)" if weighted_prediction > 0.5 else "📉 买跌(高置信度)"
+            elif not trade_recommended:
                 trade_signal = "⏸️ 观望"
+            else:
+                trade_signal = "📈 买涨" if weighted_prediction > 0.5 else "📉 买跌"
             
             # 🆕 新增：严格的技术指标过滤条件
             # 获取当前技术指标
@@ -1945,77 +2410,48 @@ class BitcoinPredictor:
                         for col in numeric_columns:
                             df_tech[col] = pd.to_numeric(df_tech[col])
                         
-                        # 计算技术指标
-                        # RSI
-                        rsi_14 = ta.momentum.rsi(df_tech['close'], window=14).iloc[-1]
+                                                # 1. 基础技术指标评分
+                        tech_score, tech_details = technical_filter_score(df_tech, direction)
                         
-                        # MACD
-                        macd = ta.trend.MACD(df_tech['close'])
-                        macd_line = macd.macd().iloc[-1]
-                        macd_signal = macd.macd_signal().iloc[-1]
-                        macd_hist = macd.macd_diff().iloc[-1]
+                        # 记录基础技术指标评分
+                        logging.info(f"📊 基础技术指标评分: {tech_score} (-10到+10)")
+                        for detail in tech_details:
+                            logging.info(f"   ➤ {detail}")
                         
-                        # 布林带
-                        bollinger = ta.volatility.BollingerBands(df_tech['close'])
-                        bb_upper = bollinger.bollinger_hband().iloc[-1]
-                        bb_middle = bollinger.bollinger_mavg().iloc[-1]
-                        bb_lower = bollinger.bollinger_lband().iloc[-1]
+                        # 2. 多时间周期一致性检查 (如果配置中启用)
+                        multi_tf_score = 0
+                        multi_tf_details = []
+                        if self.config.get('multi_timeframe_check', False):
+                            multi_tf_score, multi_tf_details = multi_timeframe_check(df_tech, direction)
+                            logging.info(f"📊 多时间周期一致性评分: {multi_tf_score} (-3到+3)")
+                            for detail in multi_tf_details:
+                                logging.info(f"   ➤ {detail}")
                         
-                        # 移动平均线
-                        sma_20 = ta.trend.sma_indicator(df_tech['close'], window=20).iloc[-1]
-                        sma_50 = ta.trend.sma_indicator(df_tech['close'], window=50).iloc[-1]
+                        # 3. 趋势确认检查 (如果配置中启用)
+                        trend_score = 0
+                        trend_details = []
+                        if self.config.get('trend_confirmation', False):
+                            trend_score, trend_details = trend_confirmation_check(df_tech, direction)
+                            logging.info(f"📊 趋势确认评分: {trend_score} (-2到+2)")
+                            for detail in trend_details:
+                                logging.info(f"   ➤ {detail}")
                         
-                        # 成交量
-                        volume_sma = df_tech['volume'].rolling(20).mean().iloc[-1]
-                        current_volume = df_tech['volume'].iloc[-1]
+                        # 4. 计算总评分
+                        total_score = tech_score + multi_tf_score + trend_score
+                        logging.info(f"📊 技术指标总评分: {total_score} = {tech_score}(基础) + {multi_tf_score}(多周期) + {trend_score}(趋势)")
                         
-                        # 🆕 严格的技术指标过滤规则
-                        tech_filters_passed = True
-                        filter_messages = []
+                        # 从配置中获取技术指标评分阈值
+                        min_score_threshold = self.config.get('tech_score_threshold', 3)
+                        high_confidence_override = self.config.get('high_confidence_override', 0.92)
                         
-                        # 规则1: 超买/超卖过滤
-                        if direction == "上涨" and rsi_14 > 70:
-                            tech_filters_passed = False
-                            filter_messages.append(f"RSI过高({rsi_14:.1f} > 70)，不适合做多")
-                        elif direction == "下跌" and rsi_14 < 30:
-                            tech_filters_passed = False
-                            filter_messages.append(f"RSI过低({rsi_14:.1f} < 30)，不适合做空")
-                        
-                        # 规则2: MACD方向与预测方向一致性检查
-                        if direction == "上涨" and macd_hist < 0:
-                            tech_filters_passed = False
-                            filter_messages.append(f"MACD柱状图为负({macd_hist:.4f})，与做多信号不一致")
-                        elif direction == "下跌" and macd_hist > 0:
-                            tech_filters_passed = False
-                            filter_messages.append(f"MACD柱状图为正({macd_hist:.4f})，与做空信号不一致")
-                        
-                        # 规则3: 布林带位置检查
-                        current_price = df_tech['close'].iloc[-1]
-                        if direction == "上涨" and current_price > bb_upper:
-                            tech_filters_passed = False
-                            filter_messages.append(f"价格已超过布林带上轨，不适合做多")
-                        elif direction == "下跌" and current_price < bb_lower:
-                            tech_filters_passed = False
-                            filter_messages.append(f"价格已低于布林带下轨，不适合做空")
-                        
-                        # 规则4: 趋势方向检查
-                        if direction == "上涨" and current_price < sma_20:
-                            tech_filters_passed = False
-                            filter_messages.append(f"价格低于20日均线，与做多信号不一致")
-                        elif direction == "下跌" and current_price > sma_20:
-                            tech_filters_passed = False
-                            filter_messages.append(f"价格高于20日均线，与做空信号不一致")
-                        
-                        # 规则5: 成交量确认
-                        if current_volume < volume_sma * 0.7:
-                            tech_filters_passed = False
-                            filter_messages.append(f"成交量过低，信号可靠性降低")
-                        
-                        # 如果没有通过技术指标过滤，则不推荐交易
-                        if not tech_filters_passed:
+                        # 只有在技术评分不足且置信度不是特别高时才阻止交易
+                        if total_score < min_score_threshold and final_confidence < high_confidence_override:
                             trade_recommended = False
-                            trade_signal = "⏸️ 观望 (技术指标过滤)"
-                            logging.info(f"⚠️ 技术指标过滤: {'; '.join(filter_messages)}")
+                            trade_signal = "⏸️ 观望 (技术指标评分不足)"
+                            logging.info(f"⚠️ 技术指标总评分({total_score})低于阈值({min_score_threshold})，不推荐交易")
+                        elif total_score < min_score_threshold:
+                            # 对于特别高置信度预测，只记录警告但不阻止交易
+                            logging.info(f"⚠️ 技术指标总评分({total_score})低于阈值，但置信度极高({final_confidence:.1%} >= {high_confidence_override:.1%})，允许交易")
             except Exception as e:
                 logging.warning(f"⚠️ 技术指标过滤出错: {e}")
             
@@ -2043,7 +2479,7 @@ class BitcoinPredictor:
             return None
     
     def calculate_technical_strength(self):
-        """计算技术指标强度，用于增强置信度"""
+        """计算技术指标强度，用于增强置信度 - 使用新的评分系统"""
         try:
             # 获取最新的技术指标数据
             api = self.api
@@ -2063,138 +2499,36 @@ class BitcoinPredictor:
             for col in numeric_columns:
                 df[col] = pd.to_numeric(df[col])
             
-            # 计算关键技术指标强度
-            strength_score = 0
+            # 获取当前预测方向
+            current_price = df['close'].iloc[-1]
+            prev_price = df['close'].iloc[-2] if len(df) > 2 else current_price
             
-            # RSI强度 (超买/超卖信号)
-            try:
-                rsi = ta.momentum.rsi(df['close'], window=14).iloc[-1]
-                if rsi < 30 or rsi > 70:  # 超买超卖
-                    strength_score += 0.1
-            except:
-                pass
+            # 默认方向基于短期价格趋势
+            direction = "上涨" if current_price > prev_price else "下跌"
             
-            # MACD强度
-            try:
-                macd = ta.trend.MACD(df['close'])
-                macd_line = macd.macd().iloc[-1]
-                macd_signal = macd.macd_signal().iloc[-1]
-                if abs(macd_line - macd_signal) > 0.1:  # MACD背离强烈
-                    strength_score += 0.1
-            except:
-                pass
+            # 使用新的技术指标评分系统
+            tech_score, tech_details = technical_filter_score(df, direction)
             
-            # 成交量强度
-            try:
-                volume_ma = df['volume'].rolling(20).mean().iloc[-1]
-                current_volume = df['volume'].iloc[-1]
-                if current_volume > volume_ma * 1.5:  # 成交量放大
-                    strength_score += 0.05
-            except:
-                pass
+            # 将评分转换为置信度增强值 (-10到+10) -> (0到0.3)
+            # 只有正分才会增加置信度
+            if tech_score > 0:
+                normalized_score = min(10, tech_score) / 10 * 0.3
+            else:
+                normalized_score = 0
             
-            # 布林带位置
-            try:
-                bollinger = ta.volatility.BollingerBands(df['close'])
-                bb_position = bollinger.bollinger_pband().iloc[-1]
-                if bb_position > 0.8 or bb_position < 0.2:  # 接近布林带边界
-                    strength_score += 0.05
-            except:
-                pass
+            logging.info(f"📊 技术强度评分: {tech_score} -> 置信度增强: {normalized_score:.4f}")
             
-            return min(0.3, strength_score)  # 最多贡献30%置信度
+            return normalized_score
             
         except Exception as e:
             logging.warning(f"计算技术强度失败: {e}")
             return 0
     
     def calculate_enhanced_technical_strength(self):
-        """计算增强技术指标强度，用于增强置信度"""
+        """计算增强技术指标强度，使用新的评分系统"""
         try:
-            # 获取最新的技术指标数据
-            api = self.api
-            klines_1m = api.client.get_klines(symbol='BTCUSDT', interval='1m', limit=100)
-            
-            if not klines_1m:
-                logging.warning("无法获取K线数据")
-                return 0
-            
-            df = pd.DataFrame(klines_1m, columns=[
-                'open_time', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_asset_volume', 'number_of_trades',
-                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-            ])
-            
-            # 数据类型转换
-            numeric_columns = ['open', 'high', 'low', 'close', 'volume']
-            for col in numeric_columns:
-                df[col] = pd.to_numeric(df[col])
-            
-            if len(df) < 50:  # 数据不足
-                logging.warning("K线数据不足，无法计算技术指标")
-                return 0
-            
-            # 🎯 简化但稳定的技术指标强度计算
-            strength_score = 0
-            
-            # 1. 简单移动平均线趋势
-            try:
-                ma_5 = df['close'].rolling(5).mean().iloc[-1]
-                ma_20 = df['close'].rolling(20).mean().iloc[-1]
-                current_price = df['close'].iloc[-1]
-                
-                # 均线排列
-                if ma_5 > ma_20 and current_price > ma_5:  # 上升趋势
-                    strength_score += 0.08
-                elif ma_5 < ma_20 and current_price < ma_5:  # 下降趋势
-                    strength_score += 0.08
-            except Exception as e:
-                logging.warning(f"计算移动平均线失败: {e}")
-            
-            # 2. 价格动量（简化版RSI概念）
-            try:
-                price_changes = df['close'].diff().dropna()
-                if len(price_changes) >= 14:
-                    gains = price_changes.where(price_changes > 0, 0)
-                    losses = -price_changes.where(price_changes < 0, 0)
-                    
-                    avg_gain = gains.rolling(14).mean().iloc[-1]
-                    avg_loss = losses.rolling(14).mean().iloc[-1]
-                    
-                    if avg_loss > 0:
-                        rs = avg_gain / avg_loss
-                        rsi = 100 - (100 / (1 + rs))
-                        
-                        # RSI信号
-                        if rsi < 30 or rsi > 70:  # 超买超卖
-                            strength_score += 0.06
-            except Exception as e:
-                logging.warning(f"计算价格动量失败: {e}")
-            
-            # 3. 成交量确认
-            try:
-                volume_ma = df['volume'].rolling(20).mean().iloc[-1]
-                current_volume = df['volume'].iloc[-1]
-                
-                if current_volume > volume_ma * 1.5:  # 成交量放大
-                    strength_score += 0.05
-            except Exception as e:
-                logging.warning(f"计算成交量确认失败: {e}")
-            
-            # 4. 价格波动率
-            try:
-                price_volatility = df['close'].rolling(20).std().iloc[-1]
-                volatility_ma = df['close'].rolling(20).std().rolling(10).mean().iloc[-1]
-                
-                if price_volatility > volatility_ma * 1.2:  # 波动增强
-                    strength_score += 0.04
-            except Exception as e:
-                logging.warning(f"计算波动率失败: {e}")
-            
-            final_score = min(0.2, strength_score)  # 最多贡献20%置信度
-            logging.info(f"📊 技术指标强度: {final_score:.4f}")
-            return final_score
-            
+            # 直接使用新的技术指标评分系统，该方法现在只是calculate_technical_strength的包装器
+            return self.calculate_technical_strength()
         except Exception as e:
             logging.error(f"计算增强技术指标强度失败: {e}")
             return 0
@@ -2356,6 +2690,17 @@ class BitcoinPredictor:
         actual_direction = '上涨' if current_price > entry_price else '下跌'
         is_correct = prediction == actual_direction
         
+        # 计算连胜次数
+        consecutive_wins = 0
+        if is_correct:
+            # 计算当前连胜次数
+            for i in range(trade_index-1, -1, -1):
+                if self.simulation_records[i].get('result') == 'WIN':
+                    consecutive_wins += 1
+                else:
+                    break
+            consecutive_wins += 1  # 加上当前这一次胜利
+        
         # 计算事件合约盈亏
         if is_correct:
             # 预测正确：获得全部回报
@@ -2363,8 +2708,16 @@ class BitcoinPredictor:
             final_amount = potential_payout  # 最终获得的金额
             result = 'WIN'
             
-            # 赢了，重置为初始投注额
-            self.current_bet_level = 0
+            # 连胜重置策略：连续获胜多少次后重置
+            reset_after_wins = self.config.get('reset_after_wins', 2)
+            
+            if consecutive_wins >= reset_after_wins:
+                # 达到连胜阈值，重置为初始投注额
+                self.current_bet_level = 0
+                logging.info(f"🔄 已达到连胜阈值({consecutive_wins}次)，重置为初始投注")
+            else:
+                # 未达到连胜阈值，仍然重置为初始投注额
+                self.current_bet_level = 0
         else:
             # 预测错误：失去全部投注
             profit_loss_amount = -bet_amount  # 损失全部本金
@@ -2388,6 +2741,8 @@ class BitcoinPredictor:
         trade['accuracy'] = is_correct
         trade['price_change'] = current_price - entry_price
         trade['price_change_pct'] = (current_price - entry_price) / entry_price * 100
+        if is_correct:
+            trade['consecutive_wins'] = consecutive_wins
         
         self.simulation_records[trade_index] = trade
         
@@ -2407,6 +2762,8 @@ class BitcoinPredictor:
         if is_correct:
             print(f"🏆 获得回报: {final_amount:.2f} USDT")
             print(f"💰 净盈利: +{profit_loss_amount:.2f} USDT")
+            if consecutive_wins > 1:
+                print(f"🔥 当前连胜: {consecutive_wins}次")
             print(f"🔄 马丁格尔策略: 赢了，下次投注回到 {self.martingale_bet_amounts[self.current_bet_level]} USDT")
         else:
             print(f"💸 失去本金: {bet_amount:.2f} USDT")
@@ -2439,23 +2796,28 @@ class BitcoinPredictor:
                 'roi_percentage': 0
             }
         
-        closed_trades = [trade for trade in self.simulation_records if trade.get('status', 'CLOSED') == 'CLOSED']
+        # 区分待结算和已结算交易
+        pending_trades = [trade for trade in self.simulation_records if trade.get('status', 'OPEN') == 'OPEN']
+        closed_trades = [trade for trade in self.simulation_records if trade.get('status', 'OPEN') == 'CLOSED']
         
+        # 计算总交易数（所有交易，包括待结算和已结算）
+        total_trades = len(self.simulation_records)
+        
+        # 如果没有已结算交易，返回基本信息
         if not closed_trades:
             return {
-                'total_trades': len(self.simulation_records),
-                'pending_trades': len([t for t in self.simulation_records if t.get('status', 'OPEN') == 'OPEN']),
+                'total_trades': total_trades,
+                'pending_trades': len(pending_trades),
                 'closed_trades': 0,
                 'message': '暂无已完成的交易'
             }
         
-        # 兼容新旧交易记录格式
-        total_trades = len(closed_trades)
+        # 只统计已结算交易的盈亏
         total_invested = 0
         total_returned = 0
         
         for trade in closed_trades:
-            # 兼容旧记录格式
+            # 兼容新旧记录格式
             if 'bet_amount' in trade:
                 # 新格式：事件合约
                 total_invested += trade['bet_amount']
@@ -2470,7 +2832,7 @@ class BitcoinPredictor:
         
         net_pnl = total_returned - total_invested
         
-        # 统计胜负
+        # 统计胜负（只计算已结算交易）
         win_trades = []
         loss_trades = []
         
@@ -2490,7 +2852,10 @@ class BitcoinPredictor:
         
         win_count = len(win_trades)
         loss_count = len(loss_trades)
-        win_rate = win_count / total_trades if total_trades > 0 else 0
+        
+        # 确保胜率计算正确（只基于已结算交易）
+        closed_trade_count = len(closed_trades)
+        win_rate = win_count / closed_trade_count if closed_trade_count > 0 else 0
         
         # 计算平均盈亏
         avg_win_amount = 0
@@ -2518,7 +2883,7 @@ class BitcoinPredictor:
                     loss_amounts.append(-5)  # 事件合约亏损5 USDT
             avg_loss_amount = sum(loss_amounts) / len(loss_amounts)
         
-        # 最近交易统计
+        # 最近交易统计（只考虑已结算交易）
         recent_trades = closed_trades[-10:] if len(closed_trades) >= 10 else closed_trades
         recent_win_count = 0
         for trade in recent_trades:
@@ -2532,18 +2897,19 @@ class BitcoinPredictor:
         recent_win_rate = recent_win_count / len(recent_trades) if recent_trades else 0
         
         return {
-            'total_trades': total_trades,
-            'pending_trades': len([t for t in self.simulation_records if t.get('status', 'OPEN') == 'OPEN']),
-            'total_invested': total_invested,
-            'total_returned': total_returned,
-            'net_pnl': net_pnl,
-            'win_count': win_count,
-            'loss_count': loss_count,
-            'win_rate': win_rate,
-            'recent_win_rate': recent_win_rate,
-            'avg_win_amount': avg_win_amount,
-            'avg_loss_amount': avg_loss_amount,
-            'roi_percentage': (net_pnl / total_invested * 100) if total_invested > 0 else 0
+            'total_trades': total_trades,  # 所有交易（包括待结算）
+            'pending_trades': len(pending_trades),  # 待结算交易
+            'closed_trades': closed_trade_count,  # 已结算交易
+            'total_invested': total_invested,  # 总投入（仅已结算）
+            'total_returned': total_returned,  # 总回报（仅已结算）
+            'net_pnl': net_pnl,  # 净盈亏（仅已结算）
+            'win_count': win_count,  # 胜利交易数（仅已结算）
+            'loss_count': loss_count,  # 失败交易数（仅已结算）
+            'win_rate': win_rate,  # 胜率（仅已结算）
+            'recent_win_rate': recent_win_rate,  # 近期胜率（仅已结算）
+            'avg_win_amount': avg_win_amount,  # 平均盈利（仅已结算）
+            'avg_loss_amount': avg_loss_amount,  # 平均亏损（仅已结算）
+            'roi_percentage': (net_pnl / total_invested * 100) if total_invested > 0 else 0  # ROI（仅已结算）
         }
     
     def display_pnl_stats(self):
@@ -2566,18 +2932,25 @@ class BitcoinPredictor:
             print(f"{'💰' * 25}")
             print(f"🎯 总交易次数: {stats['total_trades']} 笔")
             print(f"⏳ 待结算交易: {stats['pending_trades']} 笔")
-            print(f"✅ 成功交易: {stats['win_count']} 笔")
-            print(f"❌ 失败交易: {stats['loss_count']} 笔")
-            print(f"📈 整体胜率: {stats['win_rate']:.1%}")
-            print(f"📈 近期胜率: {stats['recent_win_rate']:.1%} (最近10笔)")
-            print(f"{'─' * 50}")
-            print(f"💵 总投注金额: {stats['total_invested']} USDT")
-            print(f"💰 总回收金额: {stats['total_returned']} USDT")
-            print(f"{pnl_emoji} 净盈亏: {pnl_sign}{stats['net_pnl']} USDT")
-            print(f"📊 投资回报率: {pnl_sign}{stats['roi_percentage']:.2f}%")
-            print(f"{'─' * 50}")
-            print(f"🏆 平均单笔盈利: +{stats['avg_win_amount']:.2f} USDT")
-            print(f"💸 平均单笔亏损: {stats['avg_loss_amount']:.2f} USDT")
+            print(f"✅ 已完成交易: {stats['closed_trades']} 笔")
+            
+            # 只有在有已完成交易时才显示胜负情况
+            if stats['closed_trades'] > 0:
+                print(f"   ├─ ✅ 成功交易: {stats['win_count']} 笔")
+                print(f"   └─ ❌ 失败交易: {stats['loss_count']} 笔")
+                print(f"📈 整体胜率: {stats['win_rate']:.1%}")
+                print(f"📈 近期胜率: {stats['recent_win_rate']:.1%} (最近10笔)")
+                print(f"{'─' * 50}")
+                print(f"💵 总投注金额: {stats['total_invested']} USDT")
+                print(f"💰 总回收金额: {stats['total_returned']} USDT")
+                print(f"{pnl_emoji} 净盈亏: {pnl_sign}{stats['net_pnl']} USDT")
+                print(f"📊 投资回报率: {pnl_sign}{stats['roi_percentage']:.2f}%")
+                print(f"{'─' * 50}")
+                print(f"🏆 平均单笔盈利: +{stats['avg_win_amount']:.2f} USDT")
+                print(f"💸 平均单笔亏损: {stats['avg_loss_amount']:.2f} USDT")
+            else:
+                print(f"📝 暂无已完成交易，无法计算胜率和盈亏")
+            
             print(f"{'💰' * 25}")
         
         # 添加返回机制
@@ -2618,17 +2991,43 @@ class BitcoinPredictor:
         return stats
     
     def save_simulation_records(self):
-        with open('simulation_records.json', 'w') as f:
-            json.dump(self.simulation_records, f, indent=4, default=str)
+        with open('simulation_records.json', 'w', encoding='utf-8') as f:
+            json.dump(self.simulation_records, f, indent=4, default=str, ensure_ascii=False)
     
     def load_simulation_records(self):
         if os.path.exists('simulation_records.json'):
             try:
-                with open('simulation_records.json', 'r') as f:
+                with open('simulation_records.json', 'r', encoding='utf-8') as f:
                     self.simulation_records = json.load(f)
                 logging.info(f"加载了 {len(self.simulation_records)} 条交易记录")
+            except UnicodeDecodeError as e:
+                logging.error(f"编码错误，尝试使用不同编码读取: {e}")
+                try:
+                    # 尝试使用二进制模式读取，然后检测编码
+                    with open('simulation_records.json', 'rb') as f:
+                        raw_data = f.read()
+                    
+                    # 尝试不同的编码
+                    for encoding in ['utf-8-sig', 'latin1', 'cp1252']:
+                        try:
+                            content = raw_data.decode(encoding)
+                            self.simulation_records = json.loads(content)
+                            logging.info(f"使用 {encoding} 编码成功读取了 {len(self.simulation_records)} 条交易记录")
+                            
+                            # 重新保存为UTF-8格式
+                            self.save_simulation_records()
+                            logging.info("已将交易记录重新保存为UTF-8格式")
+                            break
+                        except Exception:
+                            continue
+                except Exception as e2:
+                    logging.error(f"尝试其他编码也失败: {e2}")
+                    # 创建新的空记录
+                    self.simulation_records = []
+                    logging.warning("创建了新的空交易记录")
             except Exception as e:
                 logging.error(f"加载交易记录时出错: {e}")
+                self.simulation_records = []
     
     def plot_performance(self):
         if not self.simulation_records:
@@ -3252,15 +3651,34 @@ class BitcoinPredictor:
                                         print('\a')  # 系统提示音
                                         time.sleep(0.1)
                                     
-                                    print(f"\n{'🚨' * 60}")
+                                    # 获取当前马丁格尔投注金额
+                                    current_bet_amount = self.martingale_bet_amounts[self.current_bet_level]
+                                    potential_payout = current_bet_amount * 1.8  # 假设1.8倍回报
+                                    potential_profit = potential_payout - current_bet_amount
+                                    
+                                    # 获取技术过滤信息
+                                    tech_filters_passed = prediction_result.get('tech_filters_passed', True)
+                                    filter_messages = prediction_result.get('filter_messages', [])
+                                    filter_reason = "; ".join(filter_messages) if filter_messages else "技术指标不支持"
+                                    
+                                    # 确定正确的交易信号显示
+                                    display_signal = prediction_result['trade_signal']
+                                    if "观望" in display_signal and tech_filters_passed:
+                                        # 如果技术指标通过但信号是观望，这是因为置信度不够
+                                        display_signal = "⏸️ 观望 (置信度不足)"
+                                    elif not tech_filters_passed:
+                                        # 如果技术指标没通过，明确显示原因
+                                        display_signal = f"⏸️ 观望 (技术指标过滤)"
+                                    
+                                    print(f"\n{'🚨' * 50}")
                                     print(f"🚨🚨🚨 发现极高置信度交易机会！🚨🚨🚨")
                                     print(f"⏰ 时间: {current_time.strftime('%H:%M:%S')}")
                                     print(f"💰 价格: ${current_price:,.2f}")
-                                    print(f"🎯 信号: {prediction_result['trade_signal']}")
+                                    print(f"🎯 信号: {display_signal}")
                                     print(f"📊 方向: 预测10分钟后价格{prediction_result['direction']}")
                                     print(f"🔥 置信度: {confidence:.1f}% (极高)")
-                                    print(f"💵 投注: 5 USDT")
-                                    print(f"🏆 预期回报: 9 USDT (盈利4u)")
+                                    print(f"💵 投注: {current_bet_amount} USDT")
+                                    print(f"🏆 预期回报: {potential_payout:.1f} USDT (盈利{potential_profit:.1f}u)")
                                     
                                     # 显示详细分析信息
                                     if 'technical_strength' in prediction_result:
@@ -3271,7 +3689,7 @@ class BitcoinPredictor:
                                         print(f"🔧 置信度调整: {', '.join(prediction_result['confidence_adjustments'])}")
                                     
                                     # 显示马丁格尔策略信息
-                                    print(f"💰 马丁格尔投注: {self.martingale_bet_amounts[self.current_bet_level]} USDT (级别 {self.current_bet_level})")
+                                    print(f"💰 马丁格尔投注: {current_bet_amount} USDT (级别 {self.current_bet_level})")
                                     if self.current_bet_level > 0:
                                         print(f"📊 马丁格尔策略: 之前亏损，增加投注额以追回损失")
                                     else:
