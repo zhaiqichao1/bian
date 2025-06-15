@@ -1,0 +1,20 @@
+[
+    {
+        "trade_id": 1,
+        "timestamp": "2025-06-15 10:53:48.375357",
+        "entry_price": 105510.59,
+        "prediction": "\u4e0a\u6da8",
+        "confidence": 85.02127567257918,
+        "trade_signal": "\ud83d\udcc8 \u4e70\u6da8",
+        "bet_amount": 5,
+        "bet_level": 0,
+        "potential_payout": 9.0,
+        "status": "OPEN",
+        "result_checked": false,
+        "profit_loss_amount": 0,
+        "result_timestamp": null,
+        "exit_price": null,
+        "accuracy": null,
+        "result": null
+    }
+]

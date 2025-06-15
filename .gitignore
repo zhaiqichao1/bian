@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.env
+.venv
+venv/
+ENV/
+
+# 日志和数据文件
+*.log
+*.csv
+*.dat
+*.out
+*.pid
+*.seed
+
+# 配置文件（可能包含API密钥）
+config.json
+
+# 缓存
+.cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE相关
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db 
